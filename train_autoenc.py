@@ -18,7 +18,7 @@ from tqdm import tqdm
 from dataset import AsciiArtDataset
 import utils
 import ascii_util
-from autoencoder_models import VanillaAutoenc, VanillaDisc
+from autoencoder_models import VanillaAutoenc, VanillaDisc, VAE, kl_loss, make_distribution
 
 
 def main():
@@ -71,6 +71,8 @@ def main():
 
     parser.add_argument("-r", "--res", dest="res", type=int, default=32)
     parser.add_argument("--one-hot", dest="one_hot", action="store_true", default=False)
+    parser.add_argument("--vae", dest="vae", action="store_true", default=False,
+        help="If true, trains a VAE.")
     parser.add_argument("--validation-prop", dest="validation_prop", default=None, type=float)
     parser.add_argument("--char-dim", dest="char_dim", type=int, default=8)
     parser.add_argument("--nz", dest="nz", type=int, default=None)
@@ -116,7 +118,10 @@ def main():
     )
 
     # Vanilla Autoencoder
-    autoenc = VanillaAutoenc(n_channels=channels, z_dim=z_dim)
+    if args.vae:
+        autoenc = VAE(n_channels=channels, z_dim=z_dim)
+    else:
+        autoenc = VanillaAutoenc(n_channels=channels, z_dim=z_dim)
     autoenc.cuda()
     bce_loss = nn.BCELoss()
     bce_loss.cuda()
@@ -159,12 +164,17 @@ def main():
     else:
         start_epoch = 0
 
-    in_tensor = torch.rand(7, channels, args.res, args.res)
+    in_tensor = torch.rand(args.batch_size, channels, args.res, args.res)
+    #in_tensor = torch.rand(7, channels, args.res, args.res)
     in_tensor = in_tensor.to(device)
     print("Encoder:")
     out_tensor = utils.debug_model(autoenc.encoder, in_tensor)
-    print("Decoder:")
-    utils.debug_model(autoenc.decoder, out_tensor)
+    if not args.vae:
+        # TODO: This needs special case for args.vae = true, because the
+        # encoder's output is twice the size of the decoder's input because it
+        # has to encoder mean and std for a Gaussian distribution.
+        print("Decoder:")
+        utils.debug_model(autoenc.decoder, out_tensor)
 
     if args.adversarial:
         print("Discriminator")
@@ -174,6 +184,8 @@ def main():
 
     g_loss = None
     d_loss = None
+    # Term on KL-divergence when training with a VAE.
+    beta = 1.
 
     for epoch in tqdm(range(start_epoch, args.n_epochs)):
         for i, data in enumerate(dataloader):
@@ -184,7 +196,13 @@ def main():
             if epoch % args.train_autoenc_every == 0:
                 # Vanilla Autoencoder loss
                 optimizer.zero_grad()
-                z = autoenc.encoder(images)
+                if args.vae:
+                    latent_dist_params = autoenc.encoder(images)
+                    distribution = make_distribution(latent_dist_params)
+                    z = distribution.sample()
+                else:
+                    z = autoenc.encoder(images)
+
                 if args.latent_noise:
                     noise = Tensor(torch.randn(*z.shape, device=device) * args.latent_noise)
                     z += noise
@@ -194,6 +212,8 @@ def main():
                     loss = ce_loss(gen_im, images.argmax(1))
                 else:
                     loss = bce_loss(gen_im, images)
+                if args.vae:
+                    loss += beta * kl_loss(distribution)
 
                 loss.backward()
                 optimizer.step()
